@@ -5,7 +5,6 @@ from PIL import Image
 import fitz  # PyMuPDF
 import os
 
-
 app = Flask(__name__)
 
 # AWS S3 configuration
