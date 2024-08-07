@@ -1,5 +1,3 @@
-git init
-git init
 import boto3
 from flask import Flask, flash, request, redirect, url_for, render_template, jsonify
 from werkzeug.utils import secure_filename
