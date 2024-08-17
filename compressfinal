@@ -1,0 +1,344 @@
+import boto3
+from flask import Flask, request, jsonify, render_template
+from werkzeug.utils import secure_filename
+from PIL import Image
+import fitz  # PyMuPDF
+import os
+import ffmpeg
+import logging
+import shutil
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)
+
+# AWS S3 configuration
+s3_client = boto3.client('s3')
+BUCKET_NAME = 'compress3'  # Replace with your S3 bucket name
+
+app.secret_key = "secret key"
+app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024 * 1024  # Max file size (1 GB)
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+
+def get_file_extension(filename):
+    return os.path.splitext(filename)[1][1:].lower()
+
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf', 'mp4', 'mov', 'wav', 'mp3', 'avi', 'mkv', 'pages'}
+
+def allowed_file(filename):
+    file_extension = get_file_extension(filename).lower()
+    return file_extension in ALLOWED_EXTENSIONS
+
+@app.route('/home')
+def home():
+    return render_template('index.html')
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected for uploading'}), 400
+    
+    if file and allowed_file(file.filename):
+        try:
+            filename = secure_filename(file.filename)
+            temp_file_path = os.path.join('/tmp', filename)
+
+            # Save the file to a temporary location
+            file.save(temp_file_path)
+
+            # Define the compressed file's name and path
+            compressed_filename = f"{os.path.splitext(filename)[0]}_compressed{os.path.splitext(filename)[1]}"
+            compressed_file_path = os.path.join('/tmp', compressed_filename)
+
+            # Compress or convert the file based on its type
+            file_type = get_file_extension(filename)
+            initial_size = os.path.getsize(temp_file_path)
+            if file_type in ['mp4', 'mov', 'avi', 'mkv']:
+                compress_video(temp_file_path, compressed_file_path)
+                compressed_size = os.path.getsize(compressed_file_path)
+            elif file_type in ['wav', 'mp3']:
+                compress_audio(temp_file_path, compressed_file_path)
+                compressed_size = os.path.getsize(compressed_file_path)
+            elif file_type in ['jpg', 'jpeg', 'png', 'gif']:
+                initial_size, compressed_size = reduce_size_by_half(temp_file_path, compressed_file_path, file_type)
+            elif file_type == 'pdf':
+                initial_size, compressed_size = reduce_size_by_half(temp_file_path, compressed_file_path, file_type)
+            elif file_type == 'pages':
+                # Convert .pages to PDF as a placeholder
+                compressed_filename = f"{os.path.splitext(filename)[0]}_converted.pdf"
+                compressed_file_path = os.path.join('/tmp', compressed_filename)
+                convert_pages_to_pdf(temp_file_path, compressed_file_path)
+                compressed_size = os.path.getsize(compressed_file_path)
+            else:
+                return jsonify({'error': 'Compression for this file type is not supported'}), 400
+
+            # Upload the compressed file to S3
+            s3_client.upload_file(compressed_file_path, BUCKET_NAME, compressed_filename)
+
+            # Clean up temporary files
+            os.remove(temp_file_path)
+            os.remove(compressed_file_path)
+
+            original_file_url = f'https://{BUCKET_NAME}.s3.amazonaws.com/{filename}'
+            compressed_file_url = f'https://{BUCKET_NAME}.s3.amazonaws.com/{compressed_filename}'
+
+            return jsonify({
+                'message': 'File successfully uploaded and compressed',
+                'original_file_url': original_file_url,
+                'compressed_file_url': compressed_file_url,
+                'initial_file_size': initial_size,
+                'compressed_file_size': compressed_size
+            }), 200
+        except Exception as e:
+            logging.error(f"Error during upload or compression: {str(e)}")
+            return jsonify({'error': 'File upload or compression failed'}), 500
+    else:
+        return jsonify({'error': 'Allowed file types are - png, jpg, jpeg, gif, pdf, mp4, mov, wav, mp3, avi, mkv, pages'}), 400
+
+@app.route('/display/<filename>')
+def display_file(filename):
+    s3_url = f'https://{BUCKET_NAME}.s3.amazonaws.com/{filename}'
+    return jsonify({'file_url': s3_url}), 200
+
+@app.route('/convert/file', methods=['POST'])
+def convert_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected for uploading'}), 400
+    
+    target_format = request.form.get('format', '').lower()  # e.g., 'jpg', 'png', 'pdf', etc.
+    if file and allowed_file(file.filename):
+        try:
+            filename = secure_filename(file.filename)
+            original_format = get_file_extension(filename)
+            temp_file_path = os.path.join('/tmp', filename)
+
+            # Save the file to a temporary location
+            file.save(temp_file_path)
+
+            # Define the converted file's name and path
+            converted_filename = f"{os.path.splitext(filename)[0]}_converted.{target_format}"
+            converted_file_path = os.path.join('/tmp', converted_filename)
+
+            # Convert file format
+            if original_format == 'pages' and target_format == 'pdf':
+                convert_pages_to_pdf(temp_file_path, converted_file_path)
+            elif original_format == 'pdf' and target_format in ['jpg', 'jpeg', 'png']:
+                convert_pdf_to_image(temp_file_path, converted_file_path, target_format)
+            elif original_format in ['png', 'jpg', 'jpeg'] and target_format == 'pdf':
+                convert_image_to_pdf(temp_file_path, converted_file_path)
+            elif original_format in ['jpg', 'jpeg'] and target_format in ['png']:
+                convert_image(temp_file_path, converted_file_path, 'png')
+            elif original_format == 'png' and target_format in ['jpg', 'jpeg']:
+                convert_image(temp_file_path, converted_file_path, 'jpeg')
+            elif original_format in ['mp4', 'mov', 'avi', 'mkv'] and target_format in ['mp4', 'mov', 'avi', 'mkv']:
+                convert_video(temp_file_path, converted_file_path, target_format)
+            elif original_format in ['mp3', 'wav', 'aac'] and target_format in ['mp3', 'wav', 'aac']:
+                convert_audio(temp_file_path, converted_file_path, target_format)
+            else:
+                return jsonify({'error': 'Conversion from the selected source format to the target format is not supported'}), 400
+
+            # Upload the converted file to S3
+            s3_client.upload_file(converted_file_path, BUCKET_NAME, converted_filename)
+
+            # Clean up temporary files
+            os.remove(temp_file_path)
+            os.remove(converted_file_path)
+
+            converted_file_url = f'https://{BUCKET_NAME}.s3.amazonaws.com/{converted_filename}'
+
+            return jsonify({
+                'message': 'File successfully converted',
+                'original_format': original_format,
+                'converted_format': target_format,
+                'converted_file_url': converted_file_url
+            }), 200
+        except Exception as e:
+            logging.error(f"Error during file conversion: {str(e)}")
+            return jsonify({'error': 'File conversion failed'}), 500
+    else:
+        return jsonify({'error': 'Allowed file types are - jpg, jpeg, png, pdf, pages, mp4, mov, avi, mkv, mp3, wav, aac'}), 400
+
+@app.route('/convert/video', methods=['POST'])
+def convert_video_route():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    
+    file = request.files['file']
+    target_format = request.form.get('format', '').lower()  # e.g., 'mp4', 'mov', 'avi', etc.
+    
+    if file.filename == '' or not target_format:
+        return jsonify({'error': 'No file selected for uploading or format not specified'}), 400
+    
+    if file and allowed_file(file.filename):
+        try:
+            filename = secure_filename(file.filename)
+            original_format = get_file_extension(filename)
+            temp_file_path = os.path.join('/tmp', filename)
+
+            # Save the file to a temporary location
+            file.save(temp_file_path)
+
+            # Define the converted file's name and path
+            converted_filename = f"{os.path.splitext(filename)[0]}_converted.{target_format}"
+            converted_file_path = os.path.join('/tmp', converted_filename)
+
+            # Convert video format
+            if original_format in ['mp4', 'mov', 'avi', 'mkv'] and target_format in ['mp4', 'mov', 'avi', 'mkv']:
+                convert_video(temp_file_path, converted_file_path, target_format)
+            else:
+                return jsonify({'error': 'Conversion from the selected source format to the target format is not supported'}), 400
+
+            # Upload the converted file to S3
+            s3_client.upload_file(converted_file_path, BUCKET_NAME, converted_filename)
+
+            # Clean up temporary files
+            os.remove(temp_file_path)
+            os.remove(converted_file_path)
+
+            converted_file_url = f'https://{BUCKET_NAME}.s3.amazonaws.com/{converted_filename}'
+
+            return jsonify({
+                'message': 'Video file successfully converted',
+                'original_format': original_format,
+                'converted_format': target_format,
+                'converted_file_url': converted_file_url
+            }), 200
+        except Exception as e:
+            logging.error(f"Error during video conversion: {str(e)}")
+            return jsonify({'error': 'Video conversion failed'}), 500
+    else:
+        return jsonify({'error': 'Allowed video file types are - mp4, mov, avi, mkv'}), 400
+@app.route('/convert/audio', methods=['POST'])
+def convert_audio_route():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    
+    file = request.files['file']
+    target_format = request.form.get('format', '').lower()  # e.g., 'mp3', 'wav', 'aac'
+    
+    if file.filename == '' or not target_format:
+        return jsonify({'error': 'No file selected for uploading or format not specified'}), 400
+    
+    if file and allowed_file(file.filename):
+        try:
+            filename = secure_filename(file.filename)
+            original_format = get_file_extension(filename)
+            temp_file_path = os.path.join('/tmp', filename)
+
+            # Save the file to a temporary location
+            file.save(temp_file_path)
+
+            # Define the converted file's name and path
+            converted_filename = f"{os.path.splitext(filename)[0]}_converted.{target_format}"
+            converted_file_path = os.path.join('/tmp', converted_filename)
+
+            # Convert audio format
+            if original_format in ['mp3', 'wav', 'aac'] and target_format in ['mp3', 'wav', 'aac']:
+                convert_audio(temp_file_path, converted_file_path, target_format)
+            else:
+                return jsonify({'error': 'Conversion from the selected source format to the target format is not supported'}), 400
+
+            # Upload the converted file to S3
+            s3_client.upload_file(converted_file_path, BUCKET_NAME, converted_filename)
+
+            # Clean up temporary files
+            os.remove(temp_file_path)
+            os.remove(converted_file_path)
+
+            converted_file_url = f'https://{BUCKET_NAME}.s3.amazonaws.com/{converted_filename}'
+
+            return jsonify({
+                'message': 'Audio file successfully converted',
+                'original_format': original_format,
+                'converted_format': target_format,
+                'converted_file_url': converted_file_url
+            }), 200
+        except Exception as e:
+            logging.error(f"Error during audio conversion: {str(e)}")
+            return jsonify({'error': 'Audio conversion failed'}), 500
+    else:
+        return jsonify({'error': 'Allowed audio file types are - mp3, wav, aac'}), 400
+
+# Compression functions
+def compress_video(input_path, output_path):
+    try:
+        ffmpeg.input(input_path).output(output_path, vcodec='libx264', crf=28).run()
+    except ffmpeg.Error as e:
+        logging.error(f"ffmpeg error: {e.stderr.decode()}")
+
+def compress_audio(input_path, output_path):
+    try:
+        ffmpeg.input(input_path).output(output_path, acodec='libmp3lame', ab='128k').run()
+    except ffmpeg.Error as e:
+        logging.error(f"ffmpeg error: {e.stderr.decode()}")
+
+def reduce_size_by_half(input_path, output_path, file_type):
+    initial_size = os.path.getsize(input_path)
+    if file_type in ['jpg', 'jpeg', 'png', 'gif']:
+        image = Image.open(input_path)
+        image = image.resize((image.width // 2, image.height // 2), Image.Resampling.LANCZOS)
+        image.save(output_path, optimize=True, quality=85)
+    elif file_type == 'pdf':
+        with fitz.open(input_path) as pdf_document:
+            pdf_document.save(output_path, garbage=4, deflate=True)
+    compressed_size = os.path.getsize(output_path)
+    return initial_size, compressed_size
+
+def convert_image(input_path, output_path, target_format):
+    image = Image.open(input_path)
+    image.save(output_path, format=target_format.upper())
+
+def convert_image_to_pdf(input_path, output_path):
+    image = Image.open(input_path)
+    image.save(output_path, format='PDF')
+
+def convert_pdf_to_image(input_path, output_path, image_format):
+    pdf_document = fitz.open(input_path)
+    for page_number in range(len(pdf_document)):
+        page = pdf_document.load_page(page_number)
+        pix = page.get_pixmap()
+        output_image_path = output_path.replace(f".{image_format}", f"_{page_number}.{image_format}")
+        pix.save(output_image_path)
+
+def convert_pages_to_pdf(input_path, output_path):
+    # Placeholder for converting .pages to PDF
+    shutil.copy(input_path, output_path)
+
+def convert_video(input_path, output_path, target_format):
+    try:
+        ffmpeg.input(input_path).output(output_path, vcodec='libx264', crf=28).run()
+    except ffmpeg.Error as e:
+        logging.error(f"ffmpeg error: {e.stderr.decode()}")
+
+def convert_audio(input_path, output_path, target_format):
+    try:
+        if target_format == 'mp3':
+            ffmpeg.input(input_path).output(output_path, acodec='libmp3lame', ab='128k').run(overwrite_output=True)
+        elif target_format == 'wav':
+            ffmpeg.input(input_path).output(output_path, acodec='pcm_s16le', ac=2, ar='44100').run(overwrite_output=True)
+        elif target_format == 'aac':
+            ffmpeg.input(input_path).output(output_path, acodec='aac', ab='128k').run(overwrite_output=True)
+        else:
+            raise ValueError(f"Unsupported target audio format: {target_format}")
+
+        logging.info(f"Audio conversion successful: {input_path} to {output_path}")
+    except ffmpeg.Error as e:
+        error_message = e.stderr.decode()
+        logging.error(f"ffmpeg error during audio conversion: {error_message}")
+        raise RuntimeError(f"Audio conversion failed: {error_message}")
+    except Exception as e:
+        logging.error(f"Unexpected error during audio conversion: {str(e)}")
+        raise RuntimeError(f"Audio conversion failed: {str(e)}")
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=8000, debug=True)
